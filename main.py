@@ -226,4 +226,6 @@ if __name__ == "__main__":
         best_idx = rewards_tensor.argmax()
         p, f, m = get_stats(actions[best_idx].tolist())
         
-        print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {rewards_tensor.mean():.4f} | Valid: {len(valid_indices)}/{G} | Best: {rewards_tensor[best_idx]:.4f} (M:{m/1024**2:.1f}MB F:{f/1e6:.0f}M)")
+        # print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {rewards_tensor.mean():.4f} | Valid: {len(valid_indices)}/{G} | Best: {rewards_tensor[best_idx]:.4f} (M:{m/1024**2:.1f}MB F:{f/1e6:.0f}M)")
+        
+        print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {rewards_tensor.mean():.4f} | P-Val: {p_val:.3e} | Arch: {actions[best_idx].tolist()} {rewards_tensor[best_idx]:.4f} (M:{m/1024**2:.1f}MB F:{f/1e6:.0f}M)")
