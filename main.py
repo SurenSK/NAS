@@ -11,6 +11,7 @@ import random
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+import json
 
 # Deterministic setup
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -26,12 +27,12 @@ VOCAB = len(KERNELS) * len(CHANNELS)
 EOS = VOCAB
 SOS = VOCAB + 1
 
-# --- Constraints (Jetson Nano Envelope - loosely enforced for now) ---
+# --- Constraints (Jetson Nano Envelope) ---
 MAX_MEM_BYTES = 2 * 1024**3 
 MAX_FLOPS = 10 * 10**9
 
 # ==========================================
-# Goal: NAS Controller & Child Architecture
+# Component: Controller
 # ==========================================
 class ARController(nn.Module):
     def __init__(self, dm=64, nh=4):
@@ -62,7 +63,7 @@ def get_stats(arch):
     max_act_bytes = 0
     in_c = 3
     h, w = 32, 32 
-    B = 4 # Bytes per float32
+    B = 4 
     
     for idx in arch:
         if idx == EOS: break
@@ -96,7 +97,47 @@ class Child(nn.Module):
         return self.fc(self.gap(self.net(x)).flatten(1))
 
 # ==========================================
-# Goal: Training & Evaluation Subroutines
+# Component: Pretty Printer (For Slides)
+# ==========================================
+def describe_architecture(arch, acc):
+    print("\n" + "="*60)
+    print("BEST FOUND ARCHITECTURE SUMMARY")
+    print("="*60)
+    
+    p, f, m = get_stats(arch)
+    
+    print(f"{'Metric':<20} | {'Value':<15}")
+    print("-" * 40)
+    print(f"{'Val Accuracy':<20} | {acc:.4f}")
+    print(f"{'Parameters':<20} | {p:,}")
+    print(f"{'Est. FLOPs':<20} | {f/1e6:.2f} M")
+    print(f"{'Est. Peak RAM':<20} | {m/1024**2:.2f} MB")
+    print("-" * 60)
+    print(f"{'Layer':<10} | {'Input':<12} | {'Config':<20} | {'Output':<12}")
+    print("-" * 60)
+    
+    in_c = 3
+    h, w = 32, 32
+    
+    for i, idx in enumerate(arch):
+        if idx == EOS: break
+        k, out_c = KERNELS[idx // len(CHANNELS)], CHANNELS[idx % len(CHANNELS)]
+        padding = k // 2
+        
+        inp_s = f"{in_c}x{h}x{w}"
+        conf = f"Conv k={k} s=1 p={padding}"
+        out_s = f"{out_c}x{h}x{w}"
+        
+        print(f"{f'Conv_{i}':<10} | {inp_s:<12} | {conf:<20} | {out_s:<12}")
+        in_c = out_c
+        
+    print("-" * 60)
+    print(f"{'GAP':<10} | {f'{in_c}x{h}x{w}':<12} | {'AdaptiveAvgPool 1x1':<20} | {f'{in_c}x1x1':<12}")
+    print(f"{'FC':<10} | {in_c:<12} | {'Linear -> 10':<20} | {10:<12}")
+    print("="*60 + "\n")
+
+# ==========================================
+# Component: Training Loop
 # ==========================================
 data_tr, target_tr = None, None
 data_te, target_te = None, None
@@ -135,49 +176,35 @@ def train_and_score(net, seed):
              correct += (out.argmax(1) == target_te[i:i+1024]).sum().item()
     
     val_acc = correct / data_te.size(0)
-    # Extrapolation Heuristic
     projected_score = val_acc + 0.1 * max(0, (1.0 - final_train_loss))
     return max(0.0, projected_score)
 
-# ==========================================
-# Goal: Visualization
-# ==========================================
 def plot_dashboard(model_history, step_history):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # --- Plot 1: Step vs Avg Accuracy (with P-val highlights) ---
     steps = [s['step'] for s in step_history]
     avg_accs = [s['avg_acc'] for s in step_history]
     p_vals = [s['p_val'] for s in step_history]
     
     ax = axes[0]
     ax.plot(steps, avg_accs, color='black', linewidth=2, label='Avg Acc')
-    
-    # Add background highlights for significant steps
     for i, p in enumerate(p_vals):
         if p <= 0.05:
-            # Draw rectangle around this step interval
             ax.axvspan(steps[i]-0.5, steps[i]+0.5, facecolor='lightgreen', alpha=0.4)
             
     ax.set_xlabel("Step #")
-    ax.set_ylabel("Average Reward (Proj. Accuracy)")
-    ax.set_title("Search Stability & Significance (Green: p <= 0.05)")
+    ax.set_ylabel("Average Reward")
+    ax.set_title("Search Stability (Green: p <= 0.05)")
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(steps)
 
-    # --- Prep Data for Scatter Plots (Filter only evaluated models) ---
     valid_models = [h for h in model_history if h['acc'] > 0]
     scatter_steps = [h['step'] for h in valid_models]
     scatter_accs = [h['acc'] for h in valid_models]
-    # Convert units for readability
     scatter_flops_M = [h['flops'] / 1e6 for h in valid_models]
     scatter_mem_MB = [h['mem'] / 1024**2 for h in valid_models]
     
-    cmap_monochrome = 'Blues'
-
-    # --- Plot 2: FLOPs vs Accuracy Scatter ---
     ax = axes[1]
-    sc1 = ax.scatter(scatter_flops_M, scatter_accs, c=scatter_steps, cmap=cmap_monochrome, 
+    sc1 = ax.scatter(scatter_flops_M, scatter_accs, c=scatter_steps, cmap='Blues', 
                      alpha=0.7, edgecolors='k', linewidth=0.5, s=40)
     ax.set_xlabel("Compute (MFLOPs)")
     ax.set_ylabel("Accuracy")
@@ -185,12 +212,10 @@ def plot_dashboard(model_history, step_history):
     ax.grid(True, alpha=0.3)
     fig.colorbar(sc1, ax=ax, label='Step #')
 
-    # --- Plot 3: Memory vs Accuracy Scatter ---
     ax = axes[2]
-    sc2 = ax.scatter(scatter_mem_MB, scatter_accs, c=scatter_steps, cmap=cmap_monochrome, 
+    sc2 = ax.scatter(scatter_mem_MB, scatter_accs, c=scatter_steps, cmap='Blues', 
                      alpha=0.7, edgecolors='k', linewidth=0.5, s=40)
     ax.set_xlabel("Memory Footprint (MB)")
-    # Y-label redundant here
     ax.set_title("Pareto: Space vs Accuracy")
     ax.grid(True, alpha=0.3)
     fig.colorbar(sc2, ax=ax, label='Step #')
@@ -200,10 +225,8 @@ def plot_dashboard(model_history, step_history):
     print("\nSaved visualization to nas_dashboard.png")
 
 # ==========================================
-# Goal: Main Execution Loop
+# Component: Main Loop
 # ==========================================
-import json
-
 if __name__ == "__main__":
     set_seed(42)
 
@@ -221,18 +244,16 @@ if __name__ == "__main__":
     opt = optim.Adam(ctrl.parameters(), lr=5e-4)
     pool = ThreadPoolExecutor(max_workers=4)
     
-    # Data containers
     base_acc = []
     model_history = [] 
     step_history = []
     
-    # Global tracker for the absolute best model across all steps
     global_best_acc = 0.0
     global_best_arch = []
     global_best_state = None
 
     SEARCH_STEPS = 50
-    print(f"Starting Final Search for {SEARCH_STEPS} steps...")
+    print(f"Starting Search for {SEARCH_STEPS} steps...")
     
     for step in range(SEARCH_STEPS):
         t0 = time.time()
@@ -252,12 +273,7 @@ if __name__ == "__main__":
             if mem_bytes > MAX_MEM_BYTES: penalty += (mem_bytes - MAX_MEM_BYTES) / MAX_MEM_BYTES
             if flops > MAX_FLOPS:         penalty += (flops - MAX_FLOPS) / MAX_FLOPS
             
-            model_record = {
-                'step': step,
-                'flops': flops,
-                'mem': mem_bytes,
-                'acc': 0.0 
-            }
+            model_record = { 'step': step, 'flops': flops, 'mem': mem_bytes, 'acc': 0.0 }
             this_step_models.append(model_record)
 
             if penalty > 0:
@@ -274,12 +290,9 @@ if __name__ == "__main__":
                 final_rewards[idx] = acc
                 this_step_models[idx]['acc'] = acc
                 
-                # Capture Global Best
                 if acc > global_best_acc:
                     global_best_acc = acc
                     global_best_arch = actions[idx].tolist()
-                    # We need to grab the state dict from the specific net that won
-                    # Note: 'valid_nets' list index corresponds to 'valid_indices' order
                     net_idx = valid_indices.index(idx)
                     global_best_state = valid_nets[net_idx].state_dict()
         
@@ -310,18 +323,21 @@ if __name__ == "__main__":
         
         print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {avg_reward:.4f} | P-Val: {p_val:.3f} | Best: {rewards_tensor[best_idx]:.4f} (M:{m/1024**2:.1f}MB F:{f/1e6:.0f}M)")
 
-    # --- Save Artifacts ---
-    print(f"\nSearch Complete. Global Best Accuracy: {global_best_acc:.4f}")
-    print(f"Best Architecture: {global_best_arch}")
+    # --- End of Search Reporting ---
     
-    # Save Architecture
-    with open('best_arch.json', 'w') as f:
-        json.dump(global_best_arch, f)
-    
-    # Save Weights
-    if global_best_state:
-        torch.save(global_best_state, 'best_model.pth')
-        print("Saved best model to 'best_model.pth' and 'best_arch.json'")
+    # 1. Print Readable Architecture for Slides
+    if global_best_arch:
+        describe_architecture(global_best_arch, global_best_acc)
+        
+        # 2. Save Artifacts
+        with open('best_arch.json', 'w') as f:
+            json.dump(global_best_arch, f)
+        
+        if global_best_state:
+            torch.save(global_best_state, 'best_model.pth')
+            print("Saved best model to 'best_model.pth' and 'best_arch.json'")
+    else:
+        print("No valid architecture found.")
 
-    # Viz
+    # 3. Generate Viz
     plot_dashboard(model_history, step_history)
