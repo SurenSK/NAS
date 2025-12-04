@@ -7,9 +7,11 @@ from torchvision import datasets, transforms
 from concurrent.futures import ThreadPoolExecutor
 from scipy.stats import ttest_ind
 import time
-
+import random
+import numpy as np
 import os
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # Required for deterministic algorithms
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 d = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -21,16 +23,17 @@ VOCAB = len(KERNELS) * len(CHANNELS)
 EOS = VOCAB
 SOS = VOCAB + 1
 
+# --- Constraints (Jetson Nano Envelope) ---
+# 2 GB RAM (Bytes) and 10 GFLOPs (FP32 operations)
+MAX_MEM_BYTES = 2 * 1024**3 
+MAX_FLOPS = 10 * 10**9
+
 class ARController(nn.Module):
     def __init__(self, dm=64, nh=4):
         super().__init__()
-        # Input Embedding: Must handle Actions (0-5), EOS (6), AND SOS (7)
         self.emb = nn.Embedding(SOS + 1, dm)
         self.pos = nn.Parameter(torch.randn(1, MAX_LAYERS + 1, dm))
         self.tf = nn.TransformerEncoder(nn.TransformerEncoderLayer(dm, nh, 256, batch_first=True), 2)
-        
-        # Output Head: Can predict Actions (0-5) or EOS (6). 
-        # Must strictly EXCLUDE SOS (7) from being a valid output.
         self.head = nn.Linear(dm, EOS + 1)
 
     def forward(self, x):
@@ -40,7 +43,6 @@ class ARController(nn.Module):
     def sample(self, n):
         curr = torch.full((n, 1), SOS, dtype=torch.long, device=d)
         for _ in range(MAX_LAYERS):
-            # Forward pass now returns logits for [0..6] (Actions + EOS)
             logits = self.forward(curr)[:, -1, :]
             curr = torch.cat([curr, Categorical(logits=logits).sample().unsqueeze(1)], 1)
         return curr[:, 1:]
@@ -48,7 +50,48 @@ class ARController(nn.Module):
     def log_probs(self, actions):
         inp = torch.cat([torch.full((actions.size(0), 1), SOS, device=d), actions], 1)[:, :-1]
         return Categorical(logits=self.forward(inp)).log_prob(actions).sum(1)
+
+def get_stats(arch):
+    params = 0
+    flops = 0
+    max_act_bytes = 0
     
+    in_c = 3
+    h, w = 32, 32 # CIFAR Resolution
+    
+    # Bytes per float32
+    B = 4 
+    
+    for idx in arch:
+        if idx == EOS: break
+        k, out_c = KERNELS[idx // len(CHANNELS)], CHANNELS[idx % len(CHANNELS)]
+        
+        # 1. Parameter Count
+        params += (k * k * in_c + 1) * out_c + (4 * out_c) # Conv + BN
+        
+        # 2. FLOPs
+        flops += 2 * in_c * k * k * h * w * out_c
+        
+        # 3. Peak Memory (Activation + Input for this layer)
+        # In inference, we need to hold Input (in_c) and write to Output (out_c)
+        input_map = in_c * h * w * B
+        output_map = out_c * h * w * B
+        
+        # Track the peak memory usage of the widest layer interaction
+        if (input_map + output_map) > max_act_bytes:
+            max_act_bytes = input_map + output_map
+            
+        in_c = out_c
+    
+    # Head
+    params += (in_c + 1) * 10
+    flops += 2 * in_c * 10
+    
+    # Total RAM = Model Weights + Peak Activations
+    total_mem = (params * B) + max_act_bytes
+    
+    return params, flops, total_mem
+
 class Child(nn.Module):
     def __init__(self, arch):
         super().__init__()
@@ -67,9 +110,6 @@ class Child(nn.Module):
 data_tr, target_tr = None, None
 data_te, target_te = None, None
 
-import random
-import numpy as np
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -79,22 +119,22 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 def train_and_score(net, seed):
-    # Local generator to decouple thread randomness
     gen = torch.Generator(device='cpu')
     gen.manual_seed(seed)
-    
     opt = optim.Adam(net.parameters(), lr=1e-3)
     net.train()
     
-    # Generate permutation on CPU with local generator to avoid CUDA RNG race conditions
     indices = torch.randperm(data_tr.size(0), generator=gen)
-    
+    final_train_loss = 0.0
+
     for i in range(0, data_tr.size(0), 256):
-        idx = indices[i:i+256].to(d) # Move indices to GPU
+        idx = indices[i:i+256].to(d)
         x, y = data_tr[idx], target_tr[idx]
         opt.zero_grad()
-        F.cross_entropy(net(x), y).backward()
+        loss = F.cross_entropy(net(x), y)
+        loss.backward()
         opt.step()
+        final_train_loss = loss.item() # Capture loss of the final batch
     
     net.eval()
     with torch.no_grad():
@@ -102,10 +142,19 @@ def train_and_score(net, seed):
         for i in range(0, data_te.size(0), 1024):
              out = net(data_te[i:i+1024])
              correct += (out.argmax(1) == target_te[i:i+1024]).sum().item()
-    return correct / data_te.size(0)
+    
+    val_acc = correct / data_te.size(0)
+
+    # Simple Extrapolation Heuristic:
+    # We reward models that have lower training loss (better fit) by adding a small projection bonus.
+    # If final_train_loss is 0.0 (perfect fit), we add 0.1 to the score.
+    # If final_train_loss is > 1.0 (underfitting), this acts as a penalty.
+    projected_score = val_acc + 0.1 * (1.0 - final_train_loss)
+
+    return max(0.0, projected_score)
 
 if __name__ == "__main__":
-    set_seed(42) # Call this immediately
+    set_seed(42)
 
     print("Loading data to VRAM...")
     tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
@@ -122,34 +171,59 @@ if __name__ == "__main__":
     pool = ThreadPoolExecutor(max_workers=4)
     base_acc = []
 
-    print("Starting Search...")
+    print(f"Starting Search (Max RAM: {MAX_MEM_BYTES/1024**3:.2f}GB, Max FLOPs: {MAX_FLOPS/1e9:.2f}G)...")
+    
     for step in range(50):
         t0 = time.time()
         actions = ctrl.sample(G)
         
-        # 1. Instantiate Serially (Deterministic Weights)
-        nets = [Child(a.tolist()).to(d) for a in actions]
+        # 1. Filter & Calculate Hinge Loss
+        valid_indices = []
+        valid_nets = []
+        valid_seeds = []
+        final_rewards = [0.0] * G
         
-        # 2. Create deterministic seeds for this step
-        seeds = [step * 1000 + i for i in range(G)]
-        
-        # 3. Parallel Train (Threads use local seeds)
-        futs = [pool.submit(train_and_score, net, s) for net, s in zip(nets, seeds)]
-        rewards = [f.result() for f in futs]
-        
-        accuracies = torch.tensor(rewards, device=d)
-        
-        if step == 0:
-            base_acc = rewards
-            p_val = 1.0
-        else:
-            _, p_val = ttest_ind(base_acc, rewards, equal_var=False)
+        for i, a in enumerate(actions):
+            # Calculate stats analytically
+            p_count, flops, mem_bytes = get_stats(a.tolist())
+            
+            penalty = 0.0
+            if mem_bytes > MAX_MEM_BYTES: penalty += (mem_bytes - MAX_MEM_BYTES) / MAX_MEM_BYTES
+            if flops > MAX_FLOPS:         penalty += (flops - MAX_FLOPS) / MAX_FLOPS
+            
+            if penalty > 0:
+                final_rewards[i] = -0.1 * penalty # Weighted penalty
+            else:
+                valid_indices.append(i)
+                valid_nets.append(Child(a.tolist()).to(d))
+                valid_seeds.append(step * 1000 + i)
 
-        if accuracies.std() == 0: adv = torch.zeros_like(accuracies)
-        else: adv = (accuracies - accuracies.mean()) / (accuracies.std() + 1e-8)
+        # 2. Train ONLY valid models
+        if valid_nets:
+            futs = [pool.submit(train_and_score, net, s) for net, s in zip(valid_nets, valid_seeds)]
+            results = [f.result() for f in futs]
+            for idx, acc in zip(valid_indices, results):
+                final_rewards[idx] = acc
+        
+        # 3. RL Update
+        rewards_tensor = torch.tensor(final_rewards, device=d)
+        
+        valid_rewards = [r for r in final_rewards if r > 0]
+        if step == 0:
+            base_acc = valid_rewards if valid_rewards else [0.1]
+            p_val = 1.0
+        elif len(valid_rewards) > 1:
+            _, p_val = ttest_ind(base_acc, valid_rewards, equal_var=False)
+        else:
+            p_val = 1.0
+
+        if rewards_tensor.std() == 0: adv = torch.zeros_like(rewards_tensor)
+        else: adv = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
         
         loss = -(ctrl.log_probs(actions) * adv).mean()
         opt.zero_grad(); loss.backward(); opt.step()
 
-        best_idx = accuracies.argmax()
-        print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {accuracies.mean():.4f} | P-Val: {p_val:.3e} | Arch: {actions[best_idx].tolist()}")
+        best_idx = rewards_tensor.argmax()
+        p, f, m = get_stats(actions[best_idx].tolist())
+        
+        print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {rewards_tensor.mean():.4f} | Valid: {len(valid_indices)}/{G} | Best: {rewards_tensor[best_idx]:.4f} (M:{m/1024**2:.1f}MB F:{f/1e6:.0f}M)")
