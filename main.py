@@ -8,6 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.stats import ttest_ind
 import time
 
+import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8" # Required for deterministic algorithms
+
 d = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 KERNELS = [3, 5]
@@ -64,13 +67,30 @@ class Child(nn.Module):
 data_tr, target_tr = None, None
 data_te, target_te = None, None
 
-def train_and_score(arch):
-    net = Child(arch).to(d)
+import random
+import numpy as np
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+
+def train_and_score(net, seed):
+    # Local generator to decouple thread randomness
+    gen = torch.Generator(device='cpu')
+    gen.manual_seed(seed)
+    
     opt = optim.Adam(net.parameters(), lr=1e-3)
     net.train()
-    perm = torch.randperm(data_tr.size(0), device=d)
+    
+    # Generate permutation on CPU with local generator to avoid CUDA RNG race conditions
+    indices = torch.randperm(data_tr.size(0), generator=gen)
+    
     for i in range(0, data_tr.size(0), 256):
-        idx = perm[i:i+256]
+        idx = indices[i:i+256].to(d) # Move indices to GPU
         x, y = data_tr[idx], target_tr[idx]
         opt.zero_grad()
         F.cross_entropy(net(x), y).backward()
@@ -85,6 +105,8 @@ def train_and_score(arch):
     return correct / data_te.size(0)
 
 if __name__ == "__main__":
+    set_seed(42) # Call this immediately
+
     print("Loading data to VRAM...")
     tf = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
     ds_tr = datasets.CIFAR10('./data', True, transform=tf, download=True)
@@ -104,7 +126,15 @@ if __name__ == "__main__":
     for step in range(50):
         t0 = time.time()
         actions = ctrl.sample(G)
-        futs = [pool.submit(train_and_score, a.tolist()) for a in actions]
+        
+        # 1. Instantiate Serially (Deterministic Weights)
+        nets = [Child(a.tolist()).to(d) for a in actions]
+        
+        # 2. Create deterministic seeds for this step
+        seeds = [step * 1000 + i for i in range(G)]
+        
+        # 3. Parallel Train (Threads use local seeds)
+        futs = [pool.submit(train_and_score, net, s) for net, s in zip(nets, seeds)]
         rewards = [f.result() for f in futs]
         
         accuracies = torch.tensor(rewards, device=d)
