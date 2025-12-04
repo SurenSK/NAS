@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 from torchvision import datasets, transforms
 from concurrent.futures import ThreadPoolExecutor
 from scipy.stats import ttest_ind
+import time
 
 d = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -101,6 +102,7 @@ if __name__ == "__main__":
 
     print("Starting Search...")
     for step in range(50):
+        t0 = time.time()
         actions = ctrl.sample(G)
         futs = [pool.submit(train_and_score, a.tolist()) for a in actions]
         rewards = [f.result() for f in futs]
@@ -120,4 +122,4 @@ if __name__ == "__main__":
         opt.zero_grad(); loss.backward(); opt.step()
 
         best_idx = accuracies.argmax()
-        print(f"Step {step:02d} | Avg: {accuracies.mean():.4f} | P-Val: {p_val:.3e} | Arch: {actions[best_idx].tolist()}")
+        print(f"t+{time.time()-t0:.2f}s | Step {step:02d} | Avg: {accuracies.mean():.4f} | P-Val: {p_val:.3e} | Arch: {actions[best_idx].tolist()}")
